@@ -1,0 +1,189 @@
+Introduction:
+	In this paper, we are going to perform a automated copy of the objects(folder/file) uploaded to S3 bucket from one AWS account to another account.
+
+Solution flow:
+	When an object is uploaded to Source S3 bucket, SNS notification associated with an S3 bucket will notify the SNS topic in source account, which has a lambda function run. The Lambda function will assume the Destination Account IAM Role and copy the object from Source Bucket to Destination bucket.
+
+AWS Resource in Source Account:
+  - IAM Role
+  - S3 Bucket
+  - Lambda function
+  - SNS Notification
+
+AWS Resource in Destination Account:
+  - IAM Role
+  - Four S3 Buckets from distinct regions
+
+I. Configuration in Source AWS Account:
+
+1. IAM Role
+	Create an IAM role, this will be used for creating the Cloudwatch log and running Lambda function. The Role also should assume the Role of Destination IAM. Attach below AWS policy and Trust relationship for Lambda service. Attach Cloud watch log policy with CreateLogGroup, CreateLogStream and PutLogEvents. This policy will be used by Lambda to upload the lambda output to CloudWatch logs.
+
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+            ],
+            "Resource": "arn:aws:logs:*:*:*"
+        }
+    ]
+}
+
+,Create an inline policy to Assume the role of Destination IAM user.
+
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "sts:AssumeRole"
+            ],
+            "Resource": [
+                "arn:aws:iam::<dest acc id>:role/<dest cross account role>"
+            ]
+        }
+    ]
+}
+
+and Trust the Lambda in IAM Role.
+
+
+2. Create S3 Bucket in Source Account, to which the files will be uploaded first. Add below Bucket Access policy to the bucket.
+{
+    "Version": "2008-10-17",
+    "Statement": [
+        {
+            "Sid": "CrossAccount",
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "arn:aws:iam::<dest add id>:role/<dest account cross role>"
+            },
+            "Action": "s3:*",
+            "Resource": "arn:aws:s3:::<source bucket name>/*"
+        }
+    ]
+}
+
+
+3. Create the Lambda Function
+	Lambda function will assume the Role of Destination IAM Role and copy the S3 object from Source bucket to Destination. In the Lambda console, choose Create a Lambda function -> Authoe from scratch -> enter a function name -> Run time, choose python 2.7 -> Role, select IAM role created in above step.
+
+Paste the following into the code editor:
+
+import urllib
+import boto3
+import ast
+import json
+print('Loading function')
+
+def lambda_handler(event, context):
+    s3 = boto3.client('s3')
+    sns_message = ast.literal_eval(event['Records'][0]['Sns']['Message'])
+    target_buckets = ['<dest bucket 1>','<dest bucket 2>','<dest bucket 3>','<dest bucket 4>']
+    target_regions = ['<region of bucket 1>','<region of bucket 2>','<region of bucket 3>','<region of bucket 4>']
+    source_bucket = str(sns_message['Records'][0]['s3']['bucket']['name'])
+    key = str(urllib.unquote_plus(sns_message['Records'][0]['s3']['object']['key']).decode('utf8'))
+    copy_source = {'Bucket':source_bucket, 'Key':key}
+    sts_client = boto3.client('sts')
+    assumedRoleObject = sts_client.assume_role( RoleArn="arn:aws:iam::<dest account id>:role/<dest account role>", RoleSessionName="AssumeRoleSession1")
+    credentials = assumedRoleObject['Credentials']
+    for i in range(len(target_buckets)):
+        #target_bucket = context.function_name
+        target_bucket = target_buckets[i]
+        terget_region = target_regions[i]
+        print "Copying %s from bucket %s to bucket %s ..." % (key, source_bucket, target_bucket)
+        s3 = boto3.client( 's3', region_name = terget_region, aws_access_key_id = credentials['AccessKeyId'], aws_secret_access_key = credentials['SecretAccessKey'], aws_session_token = credentials['SessionToken'])
+        s3.copy_object(Bucket=target_bucket, Key=key, CopySource=copy_source)
+
+
+4. Create SNS Topic.
+	The SNS topic will be used by S3 bucket. When an object is uploaded to S3 bucket, it will invoke SNS Topic. SNS is subscribed with Lambda function which will trigger the Lambda function created in the previous step. Create SNS topic in Source Account. In the SNS topic options, select Edit topic policy In the Popup window, select the Advanced view TAB as below screenshot and update the policy provided below.
+
+{
+  "Version": "2008-10-17",
+  "Id": "__default_policy_ID",
+  "Statement": [
+    {
+      "Sid": "__default_statement_ID",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "*"
+      },
+      "Action": "SNS:Publish",
+      "Resource": "arn:aws:sns:us-east-1:<dest account id>:<SNS Topic name>",
+      "Condition": {
+        "ArnLike": {
+          "AWS:SourceArn": "arn:aws:s3:::<src bucket name>"
+        }
+      }
+    }
+  ]
+}
+
+Create the subscription for the SNS Topic with protocol select Lambda and lambda function created in the previous step as Endpoint. This will run the Lambda function when SNS Topic is invoked.
+
+5. Create the Notification Event for Source S3 Bucket.
+	In the S3 bucket property option select the Event option -> Add Notification to Event -> Provide the name for the Notification Event -> Select ObjectCreate(All) -> Select SNS as Send to and SNS topic name -> Save the Event Notification
+
+
+II Configuration in Destination AWS Account:
+
+1. IAM Role - destination
+	Create IAM Role, which will be used by Lambda to Copy the objects. Attach S3 Bucket Role to IAM
+
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject"
+            ],
+            "Resource": [
+                "arn:aws:s3:::<src bucket>",
+                "arn:aws:s3:::<src bucket>/*"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:PutObject"
+            ],
+            "Resource": [
+                "arn:aws:s3:::<dest bucket1>",
+                "arn:aws:s3:::<dest bucket1>/*",
+                "arn:aws:s3:::<dest bucket2>",
+                "arn:aws:s3:::<dest bucket2>/*",
+                "arn:aws:s3:::<dest bucket3>",
+                "arn:aws:s3:::<dest bucket3>/*",
+                "arn:aws:s3:::<dest bucket4>",
+                "arn:aws:s3:::<dest bucket4>/*"
+            ]
+        }
+    ]
+}
+
+Add the Trust Relationship Source Account IAM Role for Lambda service
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::<dest acc id>:role/<dest IAM role>",
+        "Service": "lambda.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+
+III Configuration Validation:
+	Upload an object to the source bucket.Verify that the object was copied successfully to the destination buckets. if object not created in few regions try increasing timeout of lambda function.
